@@ -1321,6 +1321,85 @@ impl<'d, T: Instance, Dma: SdmmcDma<T> + 'd> Sdmmc<'d, T, Dma> {
             Err(e) => Err(e),
         }
     }
+    /// Write Multiple Blocks
+    pub async fn write_blocks(&mut self, address:u32, buffer:&[u32]) -> Result<(), Error> {
+        // write_blocks_begin
+        let card = self.card.as_mut().ok_or(Error::NoCard)?;
+        let rca = card.rca;
+        let buffer_len=buffer.len()/128;
+        // TODO check if buffer_len is number of blocks or bytes.
+        // assert_eq!(buffer_len % 512, 0, "Buffer length must be multiple of 512");
+        // let n_blocks = buffer_len;
+        Self::cmd(Cmd::set_block_length(512), false)?; // CMD16
+        let regs = T::regs();
+        let on_drop = OnDrop::new(|| Self::on_drop());
+        Self::cmd(Cmd::app_cmd(rca << 16), false)?;
+        Self::cmd(Cmd::pre_erase(buffer_len as u32), false)?;
+        #[cfg(sdmmc_v1)]
+        Self::cmd(Cmd::write_multiple_blocks(address), false)?;
+        let transfer = self.prepare_datapath_write(buffer, (buffer_len * 512) as u32, 9);
+        InterruptHandler::<T>::data_interrupts(true);
+
+        #[cfg(sdmmc_v2)]
+        Self::cmd(Cmd::write_multiple_blocks(address), false)?;
+        // poll BSY bit of ATA status register using FAST_IO (CMD39)
+        // See stm32f411 Errata
+        // let add:u32=15;
+        // Self::cmd(Cmd::fast_io(rca << 16|add<<8), true)?;
+        // let r4 = regs.respr(4).read().cardstatus();
+        // #[cfg(defmt)]
+        // defmt::info!("r4: {}", r4);
+
+        // write_blocks_feed
+        let mut i =0;
+        let res = poll_fn(|cx| {
+            T::state().register(cx.waker());
+            let status = regs.star().read();
+
+            if status.dcrcfail() {
+                return Poll::Ready(Err(Error::Crc));
+            }
+            if status.dtimeout() {
+                return Poll::Ready(Err(Error::Timeout));
+            }
+            #[cfg(sdmmc_v1)]
+            if status.stbiterr() {
+                return Poll::Ready(Err(Error::StBitErr));
+            }
+            if status.dataend() {
+                return Poll::Ready(Ok(()));
+            }
+            // TODO do we need to load new data into fifo?
+            Poll::Pending
+        })
+            .await;
+        Self::cmd(Cmd::stop_transmission(),false)?; //CMD12
+        Self::clear_interrupt_flags();
+
+        // write_blocks_conclude
+        match res {
+            Ok(_) => {
+                on_drop.defuse();
+                Self::stop_datapath();
+                drop(transfer);
+
+                // TODO: Make this configurable
+                let mut timeout: u32 = 0x00FF_FFFF;
+
+                // Try to read card status (ACMD13)
+                while timeout > 0 {
+                    match self.read_sd_status().await {
+                        Ok(_) => return Ok(()),
+                        Err(Error::Timeout) => (yield_now().await), // Try again
+                        Err(e) => return Err(e),
+                    }
+                    timeout -= 1;
+                }
+                Err(Error::SoftwareTimeout)
+            }
+            Err(e) => Err(e),
+        }
+    }
 
     /// Get a reference to the initialized card
     ///
@@ -1412,9 +1491,9 @@ impl Cmd {
     }
 
     /// CMD12:
-    //const fn stop_transmission() -> Cmd {
-    //    Cmd::new(12, 0, Response::Short)
-    //}
+    const fn stop_transmission() -> Cmd {
+       Cmd::new(12, 0, Response::Short)
+    }
 
     /// CMD13: Ask card to send status register
     /// ACMD13: SD Status
@@ -1433,13 +1512,28 @@ impl Cmd {
     }
 
     /// CMD18: Multiple Block Read
-    //const fn read_multiple_blocks(addr: u32) -> Cmd {
-    //    Cmd::new(18, addr, Response::Short)
-    //}
+    const fn read_multiple_blocks(addr: u32) -> Cmd {
+       Cmd::new(18, addr, Response::Short)
+    }
+
+    /// ACMD23 Pre-Erase
+    const fn pre_erase(num_blocks:u32)->Cmd{
+        Cmd::new(23, num_blocks, Response::Short)
+    }
 
     /// CMD24: Block Write
     const fn write_single_block(addr: u32) -> Cmd {
         Cmd::new(24, addr, Response::Short)
+    }
+
+    /// CMD25: Multiple Block Write
+    const fn write_multiple_blocks(addr:u32) -> Cmd {
+        Cmd::new(25, addr, Response::Short)
+    }
+
+    /// CMD39: FAST_IO
+    const fn fast_io(arg:u32) -> Cmd {
+        Cmd::new(39, arg, Response::Short)
     }
 
     const fn app_op_cmd(arg: u32) -> Cmd {
