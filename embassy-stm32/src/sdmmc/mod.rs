@@ -11,7 +11,7 @@ use embassy_hal_internal::drop::OnDrop;
 use embassy_hal_internal::{into_ref, PeripheralRef};
 use embassy_sync::waitqueue::AtomicWaker;
 use sdio_host::{BusWidth, CardCapacity, CardStatus, CurrentState, SDStatus, CID, CSD, OCR, SCR};
-
+use embassy_futures::yield_now;
 use crate::dma::NoDma;
 #[cfg(gpio_v2)]
 use crate::gpio::Pull;
@@ -1311,7 +1311,7 @@ impl<'d, T: Instance, Dma: SdmmcDma<T> + 'd> Sdmmc<'d, T, Dma> {
                 while timeout > 0 {
                     match self.read_sd_status().await {
                         Ok(_) => return Ok(()),
-                        Err(Error::Timeout) => (), // Try again
+                        Err(Error::Timeout) => (yield_now().await), // Try again
                         Err(e) => return Err(e),
                     }
                     timeout -= 1;
